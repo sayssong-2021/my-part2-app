@@ -1,11 +1,15 @@
 """
 Streamlit 기반 할 일(To-Do) 관리 단일 페이지 애플리케이션
+네이버 '공군' 관련 실시간 뉴스 우측 배너 위젯 포함
 프로젝트 규칙 및 아키텍처 가이드라인을 준수하여 작성되었습니다.
 """
 
 from datetime import datetime
+import re
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from urllib.parse import quote
 import uuid
+import requests
 import streamlit as st
 
 # ==============================================================================
@@ -13,7 +17,7 @@ import streamlit as st
 # ==============================================================================
 PAGE_TITLE: str = "스마트 할 일 관리자 (To-Do)"
 PAGE_ICON: str = "✅"
-LAYOUT_MODE: str = "centered"
+LAYOUT_MODE: str = "wide"  # 우측 배너 배치를 위한 와이드 레이아웃
 
 SESSION_KEY_TODOS: str = "todos_list"
 SESSION_KEY_INPUT: str = "new_todo_input_text"
@@ -25,6 +29,14 @@ FILTER_OPTIONS: Tuple[str, str, str] = (FILTER_ALL, FILTER_PENDING, FILTER_COMPL
 
 PROGRESS_DECIMAL_PLACES: int = 1
 PERCENT_MULTIPLIER: float = 100.0
+
+# 네이버 뉴스 관련 상수
+NEWS_KEYWORD: str = "공군"
+NEWS_SEARCH_URL: str = "https://search.naver.com/search.naver?where=news&query={keyword}"
+NEWS_FETCH_COUNT: int = 6
+NEWS_CACHE_TTL_SECONDS: int = 600  # 10분 캐시
+NEWS_REQUEST_TIMEOUT_SECONDS: int = 5
+NEWS_BANNER_HEADER: str = "🛩️ 공군 실시간 뉴스"
 
 DEFAULT_SAMPLE_TODOS: List[Dict[str, Any]] = [
     {
@@ -58,8 +70,13 @@ class TodoItem(TypedDict):
     created_at: str
 
 
+class NewsItem(TypedDict):
+    title: str
+    link: str
+
+
 # ==============================================================================
-# 캐싱 및 비용 연산 함수 (@st.cache_data)
+# 캐싱 및 외부 데이터 연동 함수 (@st.cache_data)
 # ==============================================================================
 @st.cache_data
 def calculate_todo_metrics(
@@ -72,19 +89,72 @@ def calculate_todo_metrics(
     total_count: int = len(todos_tuple)
     completed_count: int = sum(1 for _, is_done in todos_tuple if is_done)
     pending_count: int = total_count - completed_count
-    
+
     completion_rate: float = (
         round((completed_count / total_count) * PERCENT_MULTIPLIER, PROGRESS_DECIMAL_PLACES)
         if total_count > 0
         else 0.0
     )
-    
+
     return {
         "total": total_count,
         "completed": completed_count,
         "pending": pending_count,
         "rate": completion_rate,
     }
+
+
+@st.cache_data(ttl=NEWS_CACHE_TTL_SECONDS)
+def fetch_naver_news(
+    keyword: str = NEWS_KEYWORD, max_count: int = NEWS_FETCH_COUNT
+) -> List[Dict[str, str]]:
+    """
+    네이버 뉴스 검색에서 키워드와 관련된 최신 기사(제목, 원문 링크)를 가져옵니다.
+    @st.cache_data(ttl=600)을 적용하여 10분간 캐싱됩니다.
+    """
+    encoded_query: str = quote(keyword)
+    url: str = NEWS_SEARCH_URL.format(keyword=encoded_query)
+    headers: Dict[str, str] = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+
+    news_list: List[Dict[str, str]] = []
+    seen_links: set = set()
+
+    try:
+        response = requests.get(url, headers=headers, timeout=NEWS_REQUEST_TIMEOUT_SECONDS)
+        if response.status_code == 200:
+            matches = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', response.text)
+            for href, text in matches:
+                if ("news" in href or "article" in href or "n.news.naver.com" in href) and href.startswith("http"):
+                    clean_title: str = re.sub(r"<[^>]+>", "", text).strip()
+                    clean_title = (
+                        clean_title.replace("새 창 열림", "")
+                        .replace("&quot;", '"')
+                        .replace("&amp;", "&")
+                        .replace("&lt;", "<")
+                        .replace("&gt;", ">")
+                        .strip()
+                    )
+
+                    if (
+                        len(clean_title) >= 12
+                        and href not in seen_links
+                        and not any(ex in clean_title for ex in ["네이버뉴스", "언론사", "기사 바로가기"])
+                    ):
+                        seen_links.add(href)
+                        news_list.append({"title": clean_title, "link": href})
+                        if len(news_list) >= max_count:
+                            break
+    except Exception:
+        # 네트워크 지연 또는 예외 시 안전한 빈 리스트 반환
+        return []
+
+    return news_list
 
 
 # ==============================================================================
@@ -200,7 +270,6 @@ def render_header() -> None:
 
 def render_summary_metrics(todos: List[Dict[str, Any]]) -> None:
     """완료/미완료 개수 요약 카드 및 진행률 바 렌더링"""
-    # 캐시를 위한 불변 튜플 변환
     todos_tuple: Tuple[Tuple[str, bool], ...] = tuple(
         (item["id"], item["is_completed"]) for item in todos
     )
@@ -216,7 +285,6 @@ def render_summary_metrics(todos: List[Dict[str, Any]]) -> None:
     with col4:
         st.metric(label="달성률", value=f"{metrics['rate']}%")
 
-    # 달성률 진행 바 표시
     progress_val: float = min(max(metrics["rate"] / PERCENT_MULTIPLIER, 0.0), 1.0)
     st.progress(progress_val, text=f"전체 달성률: {metrics['rate']}%")
     st.write("")
@@ -231,7 +299,6 @@ def render_sidebar(todos: List[Dict[str, Any]]) -> Tuple[str, str]:
         st.header("🔍 검색 및 필터")
         st.caption("작업을 검색하거나 상태별로 모아보세요.")
 
-        # 검색 위젯
         search_query = st.text_input(
             label="할 일 검색",
             placeholder="검색어 입력...",
@@ -239,7 +306,6 @@ def render_sidebar(todos: List[Dict[str, Any]]) -> Tuple[str, str]:
         )
 
         st.write("")
-        # 필터 위젯
         selected_filter = st.radio(
             label="상태 필터",
             options=FILTER_OPTIONS,
@@ -290,13 +356,11 @@ def render_todo_item_row(item: Dict[str, Any]) -> None:
     is_done: bool = item["is_completed"]
     created_at: str = item.get("created_at", "")
 
-    # 상태 아이콘 규칙: 완료 ✅ / 미완료 ⬜
     status_icon: str = "✅" if is_done else "⬜"
 
     col_chk, col_text, col_del = st.columns([0.8, 6.2, 1.0])
 
     with col_chk:
-        # 체크박스 상태 변경 시 토글 핸들러 실행
         st.checkbox(
             label=f"완료 체크 {item_id}",
             value=is_done,
@@ -339,6 +403,41 @@ def render_todo_list(filtered_todos: List[Dict[str, Any]]) -> None:
         render_todo_item_row(item)
 
 
+def render_news_banner(news_items: List[Dict[str, str]]) -> None:
+    """
+    우측 배너 영역에 네이버 실시간 공군 관련 뉴스 렌더링
+    """
+    with st.container(border=True):
+        col_title, col_btn = st.columns([3, 1])
+        with col_title:
+            st.subheader(NEWS_BANNER_HEADER)
+        with col_btn:
+            if st.button("🔄", help="뉴스를 새로고침합니다.", key="btn_refresh_news"):
+                st.cache_data.clear()
+                st.rerun()
+
+        st.caption(f"네이버 실시간 **'{NEWS_KEYWORD}'** 관련 주요 기사")
+        st.divider()
+
+        if not news_items:
+            st.info("현재 공군 관련 뉴스를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
+            return
+
+        for idx, news in enumerate(news_items, start=1):
+            title = news["title"]
+            link = news["link"]
+            st.markdown(
+                f"""
+                <div style="padding: 10px 12px; margin-bottom: 10px; border-radius: 8px; background-color: rgba(30, 136, 229, 0.07); border-left: 4px solid #1E88E5;">
+                    <a href="{link}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; color: inherit; font-size: 0.93rem; font-weight: 500; display: block; line-height: 1.4;">
+                        <strong>{idx}.</strong> {title} <span style="color: #1E88E5; font-size: 0.8rem;">↗</span>
+                    </a>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
 # ==============================================================================
 # 메인 엔트리포인트 함수
 # ==============================================================================
@@ -358,15 +457,24 @@ def main() -> None:
     # 사이드바에 필터 및 검색 위젯 배치 (UI Rules 준수)
     selected_filter, search_query = render_sidebar(current_todos)
 
-    # 요약 메트릭 및 진행률 표시
-    render_summary_metrics(current_todos)
+    # 2열(컬럼) 레이아웃 구성: 좌측 할 일 관리(68%) / 우측 공군 뉴스 배너(32%)
+    col_main, col_banner = st.columns([6.8, 3.2], gap="large")
 
-    # 신규 할 일 추가 폼
-    render_todo_input_form()
+    with col_main:
+        # 요약 메트릭 및 진행률 표시
+        render_summary_metrics(current_todos)
 
-    # 필터 및 검색 적용된 할 일 목록 표시
-    display_todos = filter_todos(current_todos, selected_filter, search_query)
-    render_todo_list(display_todos)
+        # 신규 할 일 추가 폼
+        render_todo_input_form()
+
+        # 필터 및 검색 적용된 할 일 목록 표시
+        display_todos = filter_todos(current_todos, selected_filter, search_query)
+        render_todo_list(display_todos)
+
+    with col_banner:
+        # 네이버 실시간 공군 뉴스 배너 렌더링
+        news_items = fetch_naver_news(NEWS_KEYWORD, NEWS_FETCH_COUNT)
+        render_news_banner(news_items)
 
 
 if __name__ == "__main__":
