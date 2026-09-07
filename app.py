@@ -1,10 +1,11 @@
 """
 Streamlit 기반 할 일(To-Do) 관리 단일 페이지 애플리케이션
-네이버 '공군' 관련 실시간 뉴스 우측 배너 위젯 포함
+네이버 '공군' 관련 실시간 뉴스 (기사 제목 + 썸네일 이미지) 우측 배너 위젯 포함
 프로젝트 규칙 및 아키텍처 가이드라인을 준수하여 작성되었습니다.
 """
 
 from datetime import datetime
+from html import unescape
 import re
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 from urllib.parse import quote
@@ -73,6 +74,7 @@ class TodoItem(TypedDict):
 class NewsItem(TypedDict):
     title: str
     link: str
+    image_url: Optional[str]
 
 
 # ==============================================================================
@@ -107,9 +109,9 @@ def calculate_todo_metrics(
 @st.cache_data(ttl=NEWS_CACHE_TTL_SECONDS)
 def fetch_naver_news(
     keyword: str = NEWS_KEYWORD, max_count: int = NEWS_FETCH_COUNT
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     """
-    네이버 뉴스 검색에서 키워드와 관련된 최신 기사(제목, 원문 링크)를 가져옵니다.
+    네이버 뉴스 검색에서 키워드와 관련된 최신 기사(제목, 원문 링크, 썸네일 이미지)를 가져옵니다.
     @st.cache_data(ttl=600)을 적용하여 10분간 캐싱됩니다.
     """
     encoded_query: str = quote(keyword)
@@ -122,16 +124,34 @@ def fetch_naver_news(
         )
     }
 
-    news_list: List[Dict[str, str]] = []
+    news_list: List[Dict[str, Any]] = []
     seen_links: set = set()
 
     try:
         response = requests.get(url, headers=headers, timeout=NEWS_REQUEST_TIMEOUT_SECONDS)
         if response.status_code == 200:
-            matches = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', response.text)
-            for href, text in matches:
+            text = response.text
+
+            # 1. 썸네일 이미지 매핑 추출 (href -> unescape(img_src))
+            img_matches = re.findall(
+                r'<a[^>]+href="([^"]+)"[^>]*data-heatmap-target="\.img"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"',
+                text,
+            )
+            img_dict: Dict[str, str] = {href: unescape(src) for href, src in img_matches}
+
+            # 2. 기사 제목 및 링크 추출
+            tit_matches = re.findall(
+                r'<a[^>]+href="([^"]+)"[^>]*data-heatmap-target="\.tit"[^>]*>([\s\S]*?)</a>',
+                text,
+            )
+
+            # fallback: 만약 heatmap 타겟이 없을 경우 일반 링크 매칭
+            if not tit_matches:
+                tit_matches = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', text)
+
+            for href, inner_text in tit_matches:
                 if ("news" in href or "article" in href or "n.news.naver.com" in href) and href.startswith("http"):
-                    clean_title: str = re.sub(r"<[^>]+>", "", text).strip()
+                    clean_title: str = re.sub(r"<[^>]+>", "", inner_text).strip()
                     clean_title = (
                         clean_title.replace("새 창 열림", "")
                         .replace("&quot;", '"')
@@ -140,6 +160,7 @@ def fetch_naver_news(
                         .replace("&gt;", ">")
                         .strip()
                     )
+                    clean_title = unescape(clean_title)
 
                     if (
                         len(clean_title) >= 12
@@ -147,11 +168,15 @@ def fetch_naver_news(
                         and not any(ex in clean_title for ex in ["네이버뉴스", "언론사", "기사 바로가기"])
                     ):
                         seen_links.add(href)
-                        news_list.append({"title": clean_title, "link": href})
+                        img_url: Optional[str] = img_dict.get(href)
+                        news_list.append({
+                            "title": clean_title,
+                            "link": href,
+                            "image_url": img_url,
+                        })
                         if len(news_list) >= max_count:
                             break
     except Exception:
-        # 네트워크 지연 또는 예외 시 안전한 빈 리스트 반환
         return []
 
     return news_list
@@ -403,9 +428,9 @@ def render_todo_list(filtered_todos: List[Dict[str, Any]]) -> None:
         render_todo_item_row(item)
 
 
-def render_news_banner(news_items: List[Dict[str, str]]) -> None:
+def render_news_banner(news_items: List[Dict[str, Any]]) -> None:
     """
-    우측 배너 영역에 네이버 실시간 공군 관련 뉴스 렌더링
+    우측 배너 영역에 네이버 실시간 공군 관련 뉴스 렌더링 (썸네일 이미지 + 기사 제목)
     """
     with st.container(border=True):
         col_title, col_btn = st.columns([3, 1])
@@ -423,16 +448,38 @@ def render_news_banner(news_items: List[Dict[str, str]]) -> None:
             st.info("현재 공군 관련 뉴스를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
             return
 
-        for idx, news in enumerate(news_items, start=1):
-            title = news["title"]
-            link = news["link"]
+        for news in news_items:
+            title: str = news["title"]
+            link: str = news["link"]
+            img_url: Optional[str] = news.get("image_url")
+
+            # 썸네일 이미지 HTML 또는 비행기 이모지 플레이스홀더 구성
+            if img_url:
+                img_element = (
+                    f'<img src="{img_url}" alt="기사 썸네일" '
+                    'style="width: 70px; height: 70px; object-fit: cover; border-radius: 8px; flex-shrink: 0; border: 1px solid rgba(0,0,0,0.08);">'
+                )
+            else:
+                img_element = (
+                    '<div style="width: 70px; height: 70px; border-radius: 8px; background-color: rgba(30, 136, 229, 0.12); '
+                    'display: flex; align-items: center; justify-content: center; font-size: 1.8rem; flex-shrink: 0;">🛩️</div>'
+                )
+
             st.markdown(
                 f"""
-                <div style="padding: 10px 12px; margin-bottom: 10px; border-radius: 8px; background-color: rgba(30, 136, 229, 0.07); border-left: 4px solid #1E88E5;">
-                    <a href="{link}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; color: inherit; font-size: 0.93rem; font-weight: 500; display: block; line-height: 1.4;">
-                        <strong>{idx}.</strong> {title} <span style="color: #1E88E5; font-size: 0.8rem;">↗</span>
-                    </a>
-                </div>
+                <a href="{link}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; color: inherit; display: block; margin-bottom: 12px;">
+                    <div style="display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: 10px; background-color: rgba(30, 136, 229, 0.05); border: 1px solid rgba(30, 136, 229, 0.15); transition: background 0.2s;">
+                        {img_element}
+                        <div style="flex: 1; min-width: 0;">
+                            <div style="font-size: 0.9rem; font-weight: 600; line-height: 1.35; color: inherit; word-break: keep-all; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;">
+                                {title}
+                            </div>
+                            <div style="margin-top: 5px; font-size: 0.75rem; color: #1E88E5; font-weight: 500;">
+                                기사 바로가기 ↗
+                            </div>
+                        </div>
+                    </div>
+                </a>
                 """,
                 unsafe_allow_html=True,
             )
@@ -472,7 +519,7 @@ def main() -> None:
         render_todo_list(display_todos)
 
     with col_banner:
-        # 네이버 실시간 공군 뉴스 배너 렌더링
+        # 네이버 실시간 공군 뉴스 배너 렌더링 (이미지 포함)
         news_items = fetch_naver_news(NEWS_KEYWORD, NEWS_FETCH_COUNT)
         render_news_banner(news_items)
 
