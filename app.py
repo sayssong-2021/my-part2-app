@@ -132,14 +132,20 @@ def clear_completed_todos(todos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def filter_todos(
-    todos: List[Dict[str, Any]], filter_type: str
+    todos: List[Dict[str, Any]], filter_type: str, search_query: str = ""
 ) -> List[Dict[str, Any]]:
-    """선택된 필터 조건(전체/진행 중/완료됨)에 따라 목록을 필터링합니다."""
+    """선택된 필터 조건(전체/진행 중/완료됨) 및 검색어에 따라 목록을 필터링합니다."""
+    filtered = todos
     if filter_type == FILTER_COMPLETED:
-        return [item for item in todos if item["is_completed"]]
-    if filter_type == FILTER_PENDING:
-        return [item for item in todos if not item["is_completed"]]
-    return todos
+        filtered = [item for item in filtered if item["is_completed"]]
+    elif filter_type == FILTER_PENDING:
+        filtered = [item for item in filtered if not item["is_completed"]]
+
+    if search_query and search_query.strip():
+        q = search_query.strip().lower()
+        filtered = [item for item in filtered if q in item["title"].lower()]
+
+    return filtered
 
 
 # ==============================================================================
@@ -216,6 +222,44 @@ def render_summary_metrics(todos: List[Dict[str, Any]]) -> None:
     st.write("")
 
 
+def render_sidebar(todos: List[Dict[str, Any]]) -> Tuple[str, str]:
+    """
+    사이드바에 필터 및 검색 위젯을 배치합니다. (UI Rules 준수)
+    반환값: (선택된_필터, 검색어)
+    """
+    with st.sidebar:
+        st.header("🔍 검색 및 필터")
+        st.caption("작업을 검색하거나 상태별로 모아보세요.")
+
+        # 검색 위젯
+        search_query = st.text_input(
+            label="할 일 검색",
+            placeholder="검색어 입력...",
+            key="sidebar_search_query",
+        )
+
+        st.write("")
+        # 필터 위젯
+        selected_filter = st.radio(
+            label="상태 필터",
+            options=FILTER_OPTIONS,
+            index=0,
+            key="sidebar_filter_radio",
+        )
+
+        st.divider()
+        completed_count = sum(1 for item in todos if item["is_completed"])
+        if completed_count > 0:
+            st.button(
+                label="완료 항목 일괄 정리 🧹",
+                use_container_width=True,
+                on_click=handle_clear_completed,
+                help="완료된 모든 작업을 목록에서 삭제합니다.",
+            )
+
+    return selected_filter, search_query
+
+
 def render_todo_input_form() -> None:
     """새로운 할 일 등록 입력창 렌더링"""
     with st.form(key="add_todo_form", clear_on_submit=True):
@@ -236,39 +280,18 @@ def render_todo_input_form() -> None:
             )
 
 
-def render_filter_and_actions(
-    todos: List[Dict[str, Any]]
-) -> Tuple[str, int]:
-    """필터 옵션 라디오 및 일괄 정리 버튼 렌더링"""
-    col_filter, col_action = st.columns([3, 1])
-    
-    with col_filter:
-        selected_filter = st.radio(
-            label="목록 보기 필터",
-            options=FILTER_OPTIONS,
-            horizontal=True,
-            label_visibility="collapsed",
-        )
-        
-    completed_count = sum(1 for item in todos if item["is_completed"])
-    with col_action:
-        if completed_count > 0:
-            st.button(
-                label="완료 항목 정리 🧹",
-                use_container_width=True,
-                on_click=handle_clear_completed,
-                help="완료된 모든 작업을 목록에서 삭제합니다.",
-            )
-
-    return selected_filter, completed_count
-
-
 def render_todo_item_row(item: Dict[str, Any]) -> None:
-    """개별 할 일 행 컴포넌트 렌더링"""
+    """
+    개별 할 일 행 컴포넌트 렌더링
+    목록 항목에 상태 아이콘 표시 (완료 ✅ / 미완료 ⬜) - UI Rules 준수
+    """
     item_id: str = item["id"]
     title: str = item["title"]
     is_done: bool = item["is_completed"]
     created_at: str = item.get("created_at", "")
+
+    # 상태 아이콘 규칙: 완료 ✅ / 미완료 ⬜
+    status_icon: str = "✅" if is_done else "⬜"
 
     col_chk, col_text, col_del = st.columns([0.8, 6.2, 1.0])
 
@@ -285,9 +308,15 @@ def render_todo_item_row(item: Dict[str, Any]) -> None:
 
     with col_text:
         if is_done:
-            st.markdown(f"~~**{title}**~~ 　<small style='color: gray;'>({created_at} 완료)</small>", unsafe_allow_html=True)
+            st.markdown(
+                f"{status_icon} ~~**{title}**~~ 　<small style='color: gray;'>({created_at} 완료)</small>",
+                unsafe_allow_html=True,
+            )
         else:
-            st.markdown(f"**{title}** 　<small style='color: #888;'>({created_at} 등록)</small>", unsafe_allow_html=True)
+            st.markdown(
+                f"{status_icon} **{title}** 　<small style='color: #888;'>({created_at} 등록)</small>",
+                unsafe_allow_html=True,
+            )
 
     with col_del:
         st.button(
@@ -302,7 +331,7 @@ def render_todo_item_row(item: Dict[str, Any]) -> None:
 def render_todo_list(filtered_todos: List[Dict[str, Any]]) -> None:
     """할 일 목록 컨테이너 렌더링"""
     if not filtered_todos:
-        st.info("해당하는 할 일 항목이 없습니다. 새로운 할 일을 추가해보세요!")
+        st.info("해당하는 할 일 항목이 없습니다.")
         return
 
     st.markdown("---")
@@ -326,18 +355,17 @@ def main() -> None:
 
     current_todos: List[Dict[str, Any]] = st.session_state[SESSION_KEY_TODOS]
 
+    # 사이드바에 필터 및 검색 위젯 배치 (UI Rules 준수)
+    selected_filter, search_query = render_sidebar(current_todos)
+
     # 요약 메트릭 및 진행률 표시
     render_summary_metrics(current_todos)
 
     # 신규 할 일 추가 폼
     render_todo_input_form()
-    st.write("")
 
-    # 필터 및 완료 항목 일괄 정리
-    selected_filter, _ = render_filter_and_actions(current_todos)
-
-    # 필터링된 할 일 목록 표시
-    display_todos = filter_todos(current_todos, selected_filter)
+    # 필터 및 검색 적용된 할 일 목록 표시
+    display_todos = filter_todos(current_todos, selected_filter, search_query)
     render_todo_list(display_todos)
 
 
